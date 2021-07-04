@@ -32,6 +32,68 @@ class zendesk
     }
   }
 
+  public function curl($url, $json, $action) {
+    $ch = curl_init();
+    curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+    curl_setopt($ch, CURLOPT_MAXREDIRS, 10 );
+    curl_setopt($ch, CURLOPT_USERPWD, $this->user."/token:".$this->api_key);
+    switch ($action) {
+      case "POST":
+        curl_setopt($ch, CURLOPT_CUSTOMREQUEST, "POST");
+        curl_setopt($ch, CURLOPT_POSTFIELDS, $json);
+        break;
+      case "GET":
+        curl_setopt($ch, CURLOPT_CUSTOMREQUEST, "GET");
+        break;
+      case "DELETE":
+        curl_setopt($ch, CURLOPT_CUSTOMREQUEST, "DELETE");
+        break;
+      case "PUT":
+        curl_setopt($ch, CURLOPT_CUSTOMREQUEST, "PUT");
+        curl_setopt($ch, CURLOPT_POSTFIELDS, $json);
+        break;
+      case "UPLOAD":
+        // In this case the $json var should be a Drupal file object
+        $file = fopen($json->uri, 'r');
+        $filesize = $json->filesize;
+        $filedata = '';
+        while (!feof($file)) {
+          $filedata .= fread($file, 8192);
+        }
+        curl_setopt($ch, CURLOPT_POSTFIELDS, $filedata);
+        curl_setopt($ch, CURLOPT_INFILE, $file);
+        curl_setopt($ch, CURLOPT_INFILESIZE, $filesize);
+        curl_setopt($ch, CURLOPT_CUSTOMREQUEST, "POST");
+        curl_setopt($ch, CURLOPT_BINARYTRANSFER, TRUE);
+        $url .= '?' . http_build_query(array("filename" => $json->filename));
+        break;
+      default:
+        break;
+    }
+    // Different headers for a file transfer.
+    switch ($action) {
+      case "UPLOAD":
+        curl_setopt($ch, CURLOPT_HTTPHEADER, array('Content-type: application/binary'));
+        break;
+      default:
+        curl_setopt($ch, CURLOPT_HTTPHEADER, array('Content-type: application/json'));
+        break;
+    }
+
+    curl_setopt($ch, CURLOPT_URL, $url);
+    curl_setopt($ch, CURLOPT_USERAGENT, "MozillaXYZ/1.0");
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_TIMEOUT, variable_get('zendesk_curl_timeout', 10));
+
+    $output = curl_exec($ch);
+    if ($output === FALSE) {
+      throw new Exception(curl_error($ch), curl_errno($ch));
+    }
+    curl_close($ch);
+    $decoded = json_decode($output);
+    return is_null($decoded) ? $output : $decoded;
+  }
+
   /**
    * Perform an API call.
    *
@@ -47,67 +109,8 @@ class zendesk
     {
       $url .= '.json';
     }
-
-    $ch = curl_init();
-    curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
-    curl_setopt($ch, CURLOPT_MAXREDIRS, 10 );
-    curl_setopt($ch, CURLOPT_USERPWD, $this->user."/token:".$this->api_key);
-    switch ($action) {
-    case "POST":
-      curl_setopt($ch, CURLOPT_CUSTOMREQUEST, "POST");
-      curl_setopt($ch, CURLOPT_POSTFIELDS, $json);
-      break;
-    case "GET":
-      curl_setopt($ch, CURLOPT_CUSTOMREQUEST, "GET");
-      break;
-    case "DELETE":
-      curl_setopt($ch, CURLOPT_CUSTOMREQUEST, "DELETE");
-      break;
-    case "PUT":
-      curl_setopt($ch, CURLOPT_CUSTOMREQUEST, "PUT");
-      curl_setopt($ch, CURLOPT_POSTFIELDS, $json);
-      break;
-    case "UPLOAD":
-      // In this case the $json var should be a Drupal file object
-      $file = fopen($json->uri, 'r');
-      $filesize = $json->filesize;
-      $filedata = '';
-      while (!feof($file)) {
-        $filedata .= fread($file, 8192);
-      }
-      curl_setopt($ch, CURLOPT_POSTFIELDS, $filedata);
-      curl_setopt($ch, CURLOPT_INFILE, $file);
-      curl_setopt($ch, CURLOPT_INFILESIZE, $filesize);
-      curl_setopt($ch, CURLOPT_CUSTOMREQUEST, "POST");
-      curl_setopt($ch, CURLOPT_BINARYTRANSFER, TRUE);
-      $url .= '?' . http_build_query(array("filename" => $json->filename));
-      break;
-    default:
-      break;
-    }
-    // Different headers for a file transfer.
-    switch ($action) {
-    case "UPLOAD":
-      curl_setopt($ch, CURLOPT_HTTPHEADER, array('Content-type: application/binary'));
-      break;
-    default:
-      curl_setopt($ch, CURLOPT_HTTPHEADER, array('Content-type: application/json'));
-      break;
-    }
-
-    curl_setopt($ch, CURLOPT_URL, $this->base.$url);
-    curl_setopt($ch, CURLOPT_USERAGENT, "MozillaXYZ/1.0");
-    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-    curl_setopt($ch, CURLOPT_TIMEOUT, variable_get('zendesk_curl_timeout', 10));
-
-    $output = curl_exec($ch);
-    if ($output === FALSE) {
-      throw new Exception(curl_error($ch), curl_errno($ch));
-    }
-    curl_close($ch);
-    $decoded = json_decode($output);
-
-    return is_null($decoded) ? $output : $decoded;
+    $url = $this->base . $url;
+    return $this->curl($url, $json, $action);
   }
 
   /**

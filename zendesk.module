@@ -432,6 +432,12 @@ function zendesk_advanced_queue_info() {
     'delete when completed' => TRUE,
   );
 
+  $items['zendesk_incremental_ticket_comments'] = array(
+    'label' => t('Zendesk Incremental Ticket Comments Pull'),
+    'worker callback' => 'zendesk_incremental_ticket_comment_worker',
+    'delete when completed' => TRUE,
+  );
+
   return $items;
 }
 
@@ -448,31 +454,46 @@ function zendesk_cron() {
     }
   }
   // Make sure that the ticket incremental worker is queued in some non-failed state.
-  $result = db_query("SELECT COUNT(*) FROM advancedqueue WHERE name = 'zendesk_incremental_tickets' AND status != 2;")->fetchColumn(0);
-  if (!$result) {
-    $last_success = db_query("SELECT * FROM advancedqueue WHERE name = 'zendesk_incremental_tickets' AND status = 1 ORDER BY item_id DESC;")->fetchObject();
-    $start_time = ($last_success ? unserialize($last_success->data)['start_time'] : 0);
+  zendesk_queue('zendesk_incremental_tickets', 'Zendesk incremental tickets pull');
 
-    $data = array(
-      'title' => t('Zendesk incremental tickets pull'),
-      'start_time' => $start_time,
-    );
-
-    $queue = DrupalQueue::get('zendesk_incremental_tickets');
-    $queue->createItem($data);
-  }
+  // Make sure that the ticket incremental worker is queued in some non-failed state.
+  zendesk_queue('zendesk_incremental_ticket_comments', 'Zendesk incremental ticket comments pull');
 
   // Make sure that the links worker is queued in some non-failed state.
   if (variable_get('zendesk_jira_links_active', FALSE)) {
-    $result = db_query("SELECT COUNT(*) FROM advancedqueue WHERE name = 'zendesk_jira_links' AND status != 2;")->fetchColumn(0);
-    if (!$result) {
-      $data = array(
-        'title' => t('Zendesk/Jira links pull'),
-      );
+    zendesk_queue('zendesk_jira_links', 'Zendesk/Jira links pull', FALSE);
+  }
+}
 
-      $queue = DrupalQueue::get('zendesk_jira_links');
-      $queue->createItem($data);
+/**
+ * Checks that an incremental worker is in a non-failed state and queues up data
+ * is that is true.
+ *
+ * @param string $queue_name
+ * @param string $title
+ * @param boolean $start_time
+ *
+ */
+function zendesk_queue($queue_name, $title, $start_time = TRUE) {
+  $result = db_query("SELECT COUNT(*) FROM advancedqueue WHERE name = '$queue_name' AND status = -1 OR (status = 0 AND expire > UNIX_TIMESTAMP());")->fetchColumn(0);
+  if (!$result) {
+    if ($start_time) {
+      $last_success = db_query("SELECT * FROM advancedqueue WHERE name = '$queue_name' AND status = 1 ORDER BY item_id DESC;")->fetchObject();
+      $start_time = ($last_success ? unserialize($last_success->data)['start_time'] : 0);
+  
+      $data = array(
+        'title' => t($title),
+        'start_time' => $start_time,
+      );
     }
+    else {
+      $data = array(
+        'title' => t($title),
+      );
+    }
+
+    $queue = DrupalQueue::get($queue_name);
+    $queue->createItem($data);
   }
 }
 
@@ -529,7 +550,6 @@ function zendesk_ticket_write_record($ticket) {
   // @todo: This thing
   // Convert values.
   $schema = drupal_get_schema('zendesk_tickets');
-
   foreach ($schema['fields'] as $field => $info) {
     // Skip the ticket ID field, it does not need to be updated.
     if ($field == 'id') {
@@ -565,6 +585,8 @@ function zendesk_ticket_write_record($ticket) {
       }
     }
   }
+
+
   // Assemble merge.
   $query = db_merge('zendesk_tickets')->fields($fields)->key(array('id' => $ticket->id))->execute();
   if (!$query) {
@@ -719,13 +741,19 @@ function zendesk_incremental_tickets_worker($item) {
     $url = str_replace($zd->base, '', $response->next_page);
     if (is_array($response->tickets)) {
       foreach ($response->tickets as $ticket) {
-        try {
-          zendesk_ticket_write_record($ticket);
-        }
-        catch (Exception $e) {
-          $failure_count++;
-          $success_count--;
-          advancedqueue_log_message(format_string('Invalid ticket exception for ticket ID @id: @message', ['@id' => $ticket->id, '@message' => $e->getMessage()]));
+        
+        // Allow other modules to alter the returned ticket.
+        drupal_alter('zendesk_tickets_worker', $ticket);
+
+        if (!$ticket->do_not_save) {
+          try {
+            zendesk_ticket_write_record($ticket);
+          }
+          catch (Exception $e) {
+            $failure_count++;
+            $success_count--;
+            advancedqueue_log_message(format_string('Invalid ticket exception for ticket ID @id: @message', ['@id' => $ticket->id, '@message' => $e->getMessage()]));
+          }
         }
       }
     }
@@ -739,6 +767,96 @@ function zendesk_incremental_tickets_worker($item) {
   variable_set('zendesk_incremental_ticket_last_time', $item->data['start_time']);
 
   $item->created = time() + variable_get('zendesk_incremental_ticket_refresh_timer', 600);
+  // We tell the queue processor to not delete this item normally since we are
+  // requeueing it. This causes the success to not be logged.
+  $item->skip_deletion = TRUE;
+  // We requeue ourselves here with a +10 minute go-time and an updated
+  // Zendesk increment time.
+  $queue->requeueItem($item);
+
+  $params = [
+    '@success' => $success_count,
+    '@failure' => $failure_count,
+  ];
+
+  // We log a message here because the normal operations won't record a message
+  // like this on the item status due to our requeueing shenanigans.
+  advancedqueue_log_message(format_string("Successfully finished incremental ticket processing run. Logged @success tickets updated successfully and @failure failures.", $params));
+
+  // This causes the success to be logged normally even though the details
+  // aren't recorded on the requeued item.
+  return ADVANCEDQUEUE_STATUS_SUCCESS;
+}
+
+function zendesk_incremental_ticket_comment_worker($item) {
+  $success_count = 0;
+  $failure_count = 0;
+  $start_time = (!empty($item->data['start_time']) ? $item->data['start_time'] : 0);
+  $start_time = $start_time ?: _zendesk_comment_start_time();
+
+  $zd = zendesk_initialize_library();
+  $url = '/incremental/ticket_events.json?start_time=' . $start_time . "&include=comment_events";
+  do {
+    $response = $zd->call($url, '', 'GET');
+    if (!is_object($response)) {
+      break;
+    }
+
+    $count = $response->count;
+    $success_count += $count;
+    $url = str_replace($zd->base, '', $response->next_page);
+    if (is_array($response->ticket_events)) {
+
+      foreach ($response->ticket_events as $ticket) {
+        $ticket_data = [];
+        $ticket_data['ticket_id'] = $ticket->ticket_id;
+
+        foreach ($ticket->child_events as $event) {
+          if ($event->event_type == "Comment") {
+
+            // Allow other modules to interact the returned event.
+            drupal_alter('zendesk_ticket_comment_worker', $event, $ticket_data['ticket_id']);
+
+            if (!$event->do_not_save) {
+              foreach ($event as $key => $data) {
+                if ($key == 'created_at') {
+                  $ticket_data['created_at'] = strtotime($data);
+                }
+                else if ($key == 'attachments' && !empty($data)) {
+                  foreach ($data as $attachment) {
+                    $ticket_data['attachments'][] = ["filename" =>  $attachment->file_name, "uri" => $attachment->content_url];
+                  }
+                  // We need to tell zendesk_write_comment to save the attachment
+                  // or it will just save the url of the attachment.
+                  $ticket_data['attachments_save'] = TRUE;
+                }
+                else {
+                  $ticket_data[$key] = $data;
+                }
+              }
+              try {
+                zendesk_write_comment($ticket_data);
+              }
+              catch (Exception $e) {
+                $failure_count++;
+                $success_count--;
+                advancedqueue_log_message(format_string('Invalid ticket exception for ticket ID @id: @message', ['@id' => $ticket->id, '@message' => $e->getMessage()]));
+              }
+            }
+          }
+        }
+      }
+    }
+
+  } while ($count >= 1000);
+
+  $queue = DrupalQueue::get('zendesk_incremental_ticket_comments');
+
+  $item->data['start_time'] = (!empty($response->end_time) ? $response->end_time : time());
+  // We want to let the queue item do this, but failures causing a full re-run sucks.
+  variable_set('zendesk_incremental_ticket_comment_last_time', $item->data['start_time']);
+
+  $item->created = time() + variable_get('zendesk_incremental_ticket_comment_refresh_timer', 600);
   // We tell the queue processor to not delete this item normally since we are
   // requeueing it. This causes the success to not be logged.
   $item->skip_deletion = TRUE;
@@ -778,6 +896,22 @@ function _zendesk_start_time() {
 }
 
 /**
+ * If our worker doesn't have a start time, we will sync all tickets created after the last ticket's creation.
+ * And only if this fails for any reason whatsoever, we will fallback to the zendesk_last_comment_incremental_pull
+ * variable.
+ *
+ * @return int
+ */
+function _zendesk_comment_start_time() {
+  try {
+    return db_query("SELECT created_at FROM {zendesk_comments} WHERE 1 ORDER BY comment_id DESC LIMIT 0,1;")->fetchColumn(0) + 1;
+  }
+  catch (Exception $e) {
+    return variable_get('zendesk_last_comment_incremental_pull', 0);
+  }
+}
+
+/**
  * Pull in new Jira links.
  */
 function zendesk_jira_links_worker($item) {
@@ -804,4 +938,109 @@ function zendesk_jira_links_worker($item) {
   $queue->requeueItem($item);
 
   return ADVANCEDQUEUE_STATUS_SUCCESS;
+}
+
+/**
+ * Create a ticket comment.
+ *
+ * @param array $data
+ *   You may pass any additional data here, like custom fields.
+ *
+ */
+function zendesk_write_comment($data) {
+  $attachments =[];
+  $files = [];
+  if (isset($data['attachments_save']) && $data['attachments_save'] == TRUE && !empty($data['attachments'])) {
+    $files = zendesk_attachment_save($data);
+    if (!empty($files)){
+      foreach ($files as $file) {
+        $attachments[] = ['filename'=> $file->filename, 'uri'=> $file->uri];
+      }
+    }
+  } 
+  else {
+    $attachments = $data['attachments'];
+  }
+
+  $fields = [
+    'comment_id' => $data['id'],
+    'ticket_id' => $data['ticket_id'],
+    'body' => $data['body'],
+    'author_id' => $data['author_id'],
+    'created_at' => $data['created_at'],
+    'public' => $data['public'],
+    'attachments' => serialize($attachments),
+  ];
+  
+  try {
+    db_merge('zendesk_comments')
+      ->fields($fields)
+      ->key(['comment_id' => $data['id']])
+      ->execute();
+
+    return $fields;  
+  }
+  catch (Exception $e) {
+    // @todo: Log something here.
+    watchdog_exception('zendesk', $e);
+  }
+}
+
+/**
+ * Saves comment attachments to the local file system.
+ *
+ * @param array $comment
+ * @return array
+ * 
+ */
+function zendesk_attachment_save($comment) { 
+  $saved_file = [];
+
+  foreach ($comment['attachments'] as $attachment) {
+    $file = zendesk_comment_attachment_get($attachment);
+
+    if (!empty($attachment['filename'])) {
+      $saved_file[] = zendesk_attachment_file_save($file, $attachment['filename']);
+    }
+    if (!isset($saved_file)) {
+      throw new Exception('Your file could not be saved.');
+    }
+  }
+  return $saved_file;
+}
+
+/**
+ * Performs the actual file save if a comment has an attachment
+ *
+ * @param object $file_data
+ * @param string $file_name
+ * @return object
+ */
+function zendesk_attachment_file_save($file_data, $file_name) {
+  $project_options_dir = 'public://ticket-attachments/';
+  file_prepare_directory($project_options_dir, FILE_CREATE_DIRECTORY);
+  
+  if (!($saved_file = file_save_data($file_data, $project_options_dir . $file_name, FILE_EXISTS_REPLACE ))) {
+    watchdog('zendesk', 'File %name could not be saved', array(
+      '%name' => $file_name,
+    ), WATCHDOG_ERROR);
+  }
+  else {
+    return $saved_file;
+  }
+}
+
+/**
+ * Gets the comment attachment so it can be saved to the local file system.
+ *
+ * @param [type] $file_url
+ * @return void
+ */
+function zendesk_comment_attachment_get($attachment) {
+  $zd = zendesk_initialize_library();
+  $result = $zd->curl($attachment['uri'], FALSE, 'GET');
+  if (empty($result)) {
+    throw new Exception('The file could not be retrieved.');
+  }
+  return $result;
 }
